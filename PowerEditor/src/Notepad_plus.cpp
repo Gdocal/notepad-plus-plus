@@ -5084,7 +5084,8 @@ bool Notepad_plus::activateBuffer(BufferID id, int whichOne, bool forceApplyHili
 	// (synchronously) before we let Scintilla paint it. The background queue
 	// would eventually have done the same, but the user is looking at this tab
 	// right now, so jump the queue.
-	if (pBuf && pBuf->isLazyPending())
+	const bool wasLazy = pBuf && pBuf->isLazyPending();
+	if (wasLazy)
 	{
 		MainFileManager.resolveLazyBuffer(id);
 		dropLazyLoadFromQueue(id);
@@ -5118,6 +5119,17 @@ bool Notepad_plus::activateBuffer(BufferID id, int whichOne, bool forceApplyHili
 		}
 		else
 			return false;
+	}
+
+	// Apply bookmarks deferred by lazy session restore. The view is now attached
+	// to this buffer's Scintilla doc, so we can just dispatch SCI_MARKERADD.
+	if (wasLazy && pBuf && !pBuf->_lazyPendingMarks.empty())
+	{
+		ScintillaEditView* view = (whichOne == MAIN_VIEW) ? &_mainEditView : &_subEditView;
+		for (size_t mark : pBuf->_lazyPendingMarks)
+			view->execute(SCI_MARKERADD, mark, MARK_BOOKMARK);
+		pBuf->_lazyPendingMarks.clear();
+		pBuf->_lazyPendingMarks.shrink_to_fit();
 	}
 
 	if (reload)
