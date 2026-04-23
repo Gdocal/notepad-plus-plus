@@ -5499,21 +5499,41 @@ void Notepad_plus::processSessionInsertStep()
 		const wchar_t* pFn = entry.info._fileName.c_str();
 		const int whichOne = entry.whichOne;
 
-		// CRITICAL: do NOT call GetFileAttributesExW / doesFileExist here.
-		// A session may contain unreachable paths (\\wsl.localhost\... with
-		// WSL stopped, disconnected UNC shares, unplugged external drives).
-		// A stat on such a path blocks the main thread for the SMB / NFS
-		// timeout (15–30 s), which is exactly the freeze lazy-session load
-		// is supposed to eliminate. Decide tab type from the session
-		// filename alone; resolveLazyBuffer handles any IO at activation.
+		// CRITICAL: do NOT call doesFileExist / GetFileAttributesExW on the
+		// SESSION filename here. A session may contain unreachable paths
+		// (\\wsl.localhost\... with WSL stopped, disconnected UNC shares,
+		// unplugged external drives). Stat on those blocks the main thread
+		// for the SMB / NFS timeout (15–30 s), re-introducing the freeze we
+		// are trying to eliminate. Decide tab type from the session filename
+		// string alone; resolveLazyBuffer handles any IO at activation.
 		//
 		// Discriminator: PathIsRelativeW returns FALSE for absolute
 		// filesystem paths ("C:\...", "\\wsl.localhost\...", "\\?\C:\..."),
-		// TRUE for everything else (bare "new N" tab names and any legacy
-		// relative names that may have been saved historically). Untitled
-		// tabs only have a meaningful source if they carry a backup path.
+		// TRUE for everything else (bare "new N" tab names).
 		const bool isAbsolutePath = !::PathIsRelativeW(entry.info._fileName.c_str());
-		const bool hasBackupPath = !entry.info._backupFilePath.empty();
+
+		// Backup paths on the other hand are ALWAYS local (the NPP
+		// backup/ directory under AppData / config dir), so the
+		// existence probe is safe and fast (<1 ms). We need this check
+		// to match eager snapshot-restore semantics:
+		//   * session entry has a non-empty backup path
+		//   * AND that backup file actually exists on disk
+		//     => this tab had unsaved edits; mark dirty
+		//   * otherwise, stale reference from a previous session where the
+		//     backup was manually deleted => tab is clean
+		// Without the existence check every backup-referenced tab became
+		// dirty unconditionally, giving the wrong (red) dirty icon and
+		// firing a spurious "Your backup file cannot be found" prompt
+		// per tab on shutdown.
+		bool hasValidBackup = false;
+		if (!entry.info._backupFilePath.empty())
+		{
+			WIN32_FILE_ATTRIBUTE_DATA a{};
+			hasValidBackup = ::GetFileAttributesExW(entry.info._backupFilePath.c_str(),
+					GetFileExInfoStandard, &a)
+				&& a.dwFileAttributes != INVALID_FILE_ATTRIBUTES
+				&& !(a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+		}
 
 		// Compute insertion index so tabs appear in original session order
 		// regardless of the fact that the active tab was inserted first
@@ -5528,17 +5548,22 @@ void Notepad_plus::processSessionInsertStep()
 		BufferID id = BUFFER_INVALID;
 		if (isAbsolutePath)
 		{
-			// Regular file tab. Snapshot-backup content (if any) is loaded
-			// by resolveLazyBuffer when the user activates the tab.
+			// Regular file tab. Pass the backup path only when the file
+			// actually exists — otherwise the buffer would be wrongly
+			// marked dirty (bug 1: red icon) and fileCloseAll would fire
+			// the "Your backup file cannot be found" prompt at shutdown
+			// (bug 2).
 			id = MainFileManager.newLazyDocument(
 				pFn, whichOne, entry.info._encoding,
-				(isSnapshotMode && hasBackupPath) ? entry.info._backupFilePath.c_str() : nullptr,
+				(isSnapshotMode && hasValidBackup) ? entry.info._backupFilePath.c_str() : nullptr,
 				entry.info._originalFileLastModifTimestamp,
 				insertTabIndex);
 		}
-		else if (isSnapshotMode && hasBackupPath)
+		else if (isSnapshotMode && hasValidBackup)
 		{
 			// Untitled "new N" tab restored from its snapshot backup file.
+			// Requires the backup to exist; a stale reference would leave
+			// the user with an empty tab anyway.
 			id = MainFileManager.newLazyBackupDocument(
 				pFn, entry.info._backupFilePath.c_str(),
 				whichOne, entry.info._encoding,
@@ -5547,8 +5572,9 @@ void Notepad_plus::processSessionInsertStep()
 		}
 		else
 		{
-			// Orphaned entry: real file gone, no backup. Skip silently to match
-			// the synchronous path (which erases such entries from the session).
+			// Orphaned entry (backup path missing or file on disk gone).
+			// Skip silently to match the synchronous path, which erases
+			// such entries from the session.
 			continue;
 		}
 
