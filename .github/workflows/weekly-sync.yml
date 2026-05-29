@@ -1,0 +1,149 @@
+name: weekly_sync
+
+on:
+  schedule:
+    # Sundays 04:00 UTC (07:00 Kyiv winter / 06:00 summer)
+    - cron: '0 4 * * 0'
+  workflow_dispatch:  # allow manual trigger
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebase_build_release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: feature/lazy-session-load
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        shell: pwsh
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "github-actions[bot]"
+
+      - name: Add upstream and fetch
+        shell: pwsh
+        run: |
+          git remote add upstream https://github.com/notepad-plus-plus/notepad-plus-plus.git
+          git fetch upstream --tags
+
+      - name: Attempt rebase
+        id: rebase
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          git rebase upstream/master 2>&1 | Tee-Object -FilePath rebase.log
+          if ($LASTEXITCODE -ne 0) {
+            "rebase_failed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+          "rebase_failed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Open issue on rebase conflict
+        if: steps.rebase.outputs.rebase_failed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const log = fs.readFileSync('rebase.log', 'utf8').slice(-15000);
+            const today = new Date().toISOString().slice(0, 10);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly sync conflict ${today}`,
+              body: [
+                '`feature/lazy-session-load` did not cleanly rebase onto',
+                '`upstream/master` this week. A new Claude session needs',
+                'to resolve the conflict using the instructions in',
+                'CLAUDE.md (§11 — "Helpful invariants when rebasing").',
+                '',
+                'Last 15 KB of `git rebase upstream/master` output:',
+                '',
+                '```',
+                log,
+                '```',
+              ].join('\n'),
+            });
+
+      - name: Abort if rebase failed
+        if: steps.rebase.outputs.rebase_failed == 'true'
+        shell: pwsh
+        run: |
+          git rebase --abort
+          throw "Rebase conflict — see the freshly opened Issue."
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $sln = "$pwd\PowerEditor\visual.net\notepadPlus.sln"
+          msbuild $sln /p:Configuration=Release /p:Platform=x64 /m /nologo
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          # CI does not have the user's session, so use a minimal
+          # bootstrap. The portable test_lazy is built fresh by the
+          # script if it does not exist.
+          $portable = "$pwd\test_lazy"
+          New-Item -ItemType Directory -Path $portable -Force | Out-Null
+          '<NotepadPlus></NotepadPlus>' | Set-Content "$portable\doLocalConf.xml"
+          Copy-Item "$pwd\PowerEditor\bin64\notepad++.exe" "$portable\notepad++.exe"
+
+          # Bootstrap config by running once with -nosession
+          $p = Start-Process -FilePath "$portable\notepad++.exe" -ArgumentList '-multiInst','-nosession' -PassThru
+          Start-Sleep 4
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Start-Sleep 2
+
+          # Empty session for smoke (CI does not have user data)
+          '<?xml version="1.0" encoding="UTF-8"?><NotepadPlus><Session activeView="0"><mainView activeIndex="0"></mainView></Session></NotepadPlus>' |
+            Set-Content "$portable\session.xml" -Encoding utf8
+
+          # If a config was written, enable the feature
+          $cfg = "$portable\config.xml"
+          if (Test-Path $cfg) {
+            $t = Get-Content $cfg -Raw
+            if ($t -notmatch 'LazySessionLoad') {
+              $t = $t -replace '(</GUIConfigs>)', "        <GUIConfig name=`"LazySessionLoad`">yes</GUIConfig>`r`n    `$1"
+              Set-Content $cfg $t -Encoding utf8
+            }
+          }
+
+          # Run the smoke harness against the empty session
+          $env:Path += ';C:\Program Files\PowerShell\7'
+          pwsh -File tools/smoke_test.ps1 `
+            -SessionXml "$portable\session.xml" `
+            -BackupDir "$portable\backup" `
+            -TestDir $portable `
+            -InitMaxMs 9999 `
+            -ResponsiveMaxMs 9999 `
+            -MaxStartupDialogs 0
+
+      - name: Push rebased branch
+        shell: pwsh
+        run: |
+          git push --force-with-lease origin feature/lazy-session-load
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: npp-lazy-${{ github.run_number }}-${{ github.run_id }}
+          name: npp-lazy ${{ github.run_number }} (${{ github.run_id }})
+          body: |
+            Automated weekly build from `feature/lazy-session-load`
+            rebased onto upstream master.
+
+            * Upstream HEAD: `${{ github.sha }}`
+            * Build: `notepad++.exe` (x64 Release)
+          files: PowerEditor/bin64/notepad++.exe
+          fail_on_unmatched_files: true
