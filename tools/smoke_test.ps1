@@ -17,7 +17,10 @@ param(
     [string]$BackupDir  = "$env:APPDATA\Notepad++\backup",
     [string]$TestDir    = "$PSScriptRoot\..\test_lazy",
     [string]$StockExe   = 'F:\NppBackups\stock_8.9.6.4_notepad++.exe',
-    [int]$RunSeconds         = 10,
+    # 25 s so stock NPP has time to actually finish loading a 300+ tab
+    # session (it blocks the main thread for 15-20 s) and we can observe
+    # WHEN it first becomes responsive — that's the headline metric.
+    [int]$RunSeconds         = 25,
     [int]$InitMaxMs          = 300,
     [int]$ResponsiveMaxMs    = 1500
 )
@@ -83,6 +86,8 @@ function Invoke-OnePass {
     $closeDlgs   = New-Object System.Collections.Generic.HashSet[long]
     $sustainStart = $null
     $sustainAt    = $null
+    $windowAppearedAt   = $null   # first time MainWindowHandle != 0
+    $firstResponsiveAt  = $null   # first time SendMessageTimeout returned ok
     $notRespondingCount = 0
 
     while ($sw.Elapsed.TotalSeconds -lt $RunSeconds) {
@@ -90,11 +95,17 @@ function Invoke-OnePass {
         $t = [int]$sw.ElapsedMilliseconds
         $ok = $false
         if ($proc.MainWindowHandle -ne 0) {
+            if ($null -eq $windowAppearedAt) { $windowAppearedAt = $t; Log "  window appeared at +${t}ms" }
             $r = [IntPtr]::Zero
-            $rc = [Smoke]::SendMessageTimeoutW($proc.MainWindowHandle, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 50, [ref]$r)
+            # Generous 500 ms timeout: stock can sit unresponsive for many
+            # seconds while loading a 300+ tab session — we don't want a
+            # 50 ms probe to permanently flag it "not responding" before it
+            # even gets a chance to answer.
+            $rc = [Smoke]::SendMessageTimeoutW($proc.MainWindowHandle, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 500, [ref]$r)
             $ok = ($rc -ne [IntPtr]::Zero)
         }
         if ($ok) {
+            if ($null -eq $firstResponsiveAt) { $firstResponsiveAt = $t; Log "  first responsive at +${t}ms" }
             if ($null -eq $sustainStart) { $sustainStart = $t }
             elseif ($null -eq $sustainAt -and ($t - $sustainStart) -ge 800) { $sustainAt = $sustainStart }
         } else {
@@ -159,14 +170,16 @@ function Invoke-OnePass {
     $postCount = @($postXml.NotepadPlus.Session.mainView.File).Count + @($postXml.NotepadPlus.Session.subView.File).Count
 
     return [PSCustomObject]@{
-        Label             = $Label
-        StartupDialogs    = $startupDlgs.Count
-        CloseDialogs      = $closeDlgs.Count
-        SustainedAtMs     = $sustainAt
-        InitMs            = $initMs
-        NotRespondingHits = $notRespondingCount
-        PreSessionCount   = $preCount
-        PostSessionCount  = $postCount
+        Label              = $Label
+        StartupDialogs     = $startupDlgs.Count
+        CloseDialogs       = $closeDlgs.Count
+        SustainedAtMs      = $sustainAt
+        WindowAppearedMs   = $windowAppearedAt
+        FirstResponsiveMs  = $firstResponsiveAt
+        InitMs             = $initMs
+        NotRespondingHits  = $notRespondingCount
+        PreSessionCount    = $preCount
+        PostSessionCount   = $postCount
     }
 }
 
@@ -228,6 +241,24 @@ if ($null -ne $ours.SustainedAtMs) {
 }
 
 if ($stock) {
+    # HEADLINE METRIC: how long until the main window answers SendMessage?
+    # This is exactly "time to interactive" as the user experiences it. For
+    # stock NPP on a 300+ tab session it's 15-20 s; ours should be sub-second.
+    # If ours becomes responsive at $oursMs and stock at $stockMs, we want
+    # $oursMs < $stockMs / 2 at minimum to earn the fork's keep.
+    $oursMs  = if ($null -eq $ours.FirstResponsiveMs)  { 'NEVER' } else { "$($ours.FirstResponsiveMs)ms" }
+    $stockMs = if ($null -eq $stock.FirstResponsiveMs) { 'NEVER' } else { "$($stock.FirstResponsiveMs)ms" }
+    $speedupOk = $false
+    if ($null -ne $ours.FirstResponsiveMs) {
+        if ($null -eq $stock.FirstResponsiveMs) {
+            # Stock never became responsive within $RunSeconds; ours did.
+            $speedupOk = $true
+        } elseif ($ours.FirstResponsiveMs -le $stock.FirstResponsiveMs / 2) {
+            $speedupOk = $true
+        }
+    }
+    $verdicts += @{n='time_to_interactive_vs_stock';val="$oursMs vs stock $stockMs";p=$speedupOk}
+
     # GOLDEN RULE: never more dialogs / freezes than stock.
     $verdicts += @{n='startup_dialogs_vs_stock';val="$($ours.StartupDialogs) vs stock $($stock.StartupDialogs)";p=($ours.StartupDialogs -le $stock.StartupDialogs)}
     $verdicts += @{n='close_dialogs_vs_stock';val="$($ours.CloseDialogs) vs stock $($stock.CloseDialogs)";p=($ours.CloseDialogs -le $stock.CloseDialogs)}
@@ -235,6 +266,11 @@ if ($stock) {
     $verdicts += @{n='session_count_stable';val="$($ours.PreSessionCount) -> $($ours.PostSessionCount) (stock $($stock.PreSessionCount) -> $($stock.PostSessionCount))";p=($ours.PostSessionCount -ge $stock.PostSessionCount)}
 } else {
     # Standalone limits when no stock baseline.
+    if ($null -ne $ours.FirstResponsiveMs) {
+        $verdicts += @{n='time_to_interactive_ms';val=$ours.FirstResponsiveMs;p=($ours.FirstResponsiveMs -le 2000)}
+    } else {
+        $verdicts += @{n='time_to_interactive_ms';val='NEVER';p=$false}
+    }
     $verdicts += @{n='startup_dialogs';val=$ours.StartupDialogs;p=($ours.StartupDialogs -eq 0)}
     $verdicts += @{n='close_dialogs';val=$ours.CloseDialogs;p=($ours.CloseDialogs -eq 0)}
     $verdicts += @{n='session_count_stable';val="$($ours.PreSessionCount) -> $($ours.PostSessionCount)";p=($ours.PostSessionCount -ge $ours.PreSessionCount)}
@@ -247,9 +283,9 @@ foreach ($v in $verdicts) {
     "  [$tag] $($v.n) = $($v.val)"
 }
 if ($stock) {
-    "  --- raw stock ---  startup_dlgs=$($stock.StartupDialogs) close_dlgs=$($stock.CloseDialogs) sust=$($stock.SustainedAtMs) notresp=$($stock.NotRespondingHits)"
+    "  --- raw stock ---  win_seen=$($stock.WindowAppearedMs)ms first_resp=$($stock.FirstResponsiveMs)ms startup_dlgs=$($stock.StartupDialogs) close_dlgs=$($stock.CloseDialogs) sust=$($stock.SustainedAtMs) notresp=$($stock.NotRespondingHits)"
 }
-"  --- raw ours  ---  startup_dlgs=$($ours.StartupDialogs) close_dlgs=$($ours.CloseDialogs) sust=$($ours.SustainedAtMs) notresp=$($ours.NotRespondingHits) init=$($ours.InitMs)"
+"  --- raw ours  ---  win_seen=$($ours.WindowAppearedMs)ms first_resp=$($ours.FirstResponsiveMs)ms startup_dlgs=$($ours.StartupDialogs) close_dlgs=$($ours.CloseDialogs) sust=$($ours.SustainedAtMs) notresp=$($ours.NotRespondingHits) init=$($ours.InitMs)"
 
 $anyFail = $verdicts | Where-Object { -not $_.p }
 if ($anyFail) { exit 1 } else { exit 0 }

@@ -158,12 +158,24 @@ The script must exit 0 only if all checks pass. CI uses the same
 script.
 
 Acceptance thresholds:
-- init() ≤ 300 ms
-- sustained-responsive moment ≤ 1500 ms after launch
+- **time_to_interactive_ms ≤ stock / 2** — first moment the main
+  window answers `SendMessageTimeout`. On the user's 360+ tab
+  session, stock takes ~20 s to first respond; ours should be
+  ~2 s. If ours is within 2× of stock, the fork doesn't earn its
+  keep. (This is the HEADLINE metric — it's what the user
+  experiences as "time before I can type".)
 - pre-existing-bug regression: 0 unexpected dialogs at startup
   (excludes the stock reload-externally-modified prompts which are
   the user's auto-update preference responsibility)
 - session count unchanged after close
+- not_responding_hits ≤ stock + 1 — secondary UI-freeze metric
+  (UI freezes during the run, not just at startup)
+
+The smoke test does NOT depend on the `NPP_STARTUP_TRACE` compile
+flag for these — it measures everything externally via
+`SendMessageTimeoutW`. The legacy `NPP_STARTUP_TRACE`-based
+`init_ms` is still read if the build was compiled with the flag,
+but is no longer required.
 
 ---
 
