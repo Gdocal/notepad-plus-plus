@@ -16,7 +16,7 @@ param(
     [string]$SessionXml = "$env:APPDATA\Notepad++\session.xml",
     [string]$BackupDir  = "$env:APPDATA\Notepad++\backup",
     [string]$TestDir    = "$PSScriptRoot\..\test_lazy",
-    [string]$StockExe   = 'F:\NppBackups\stock_8.9.6.1_notepad++.exe',
+    [string]$StockExe   = 'F:\NppBackups\stock_8.9.6.4_notepad++.exe',
     [int]$RunSeconds         = 10,
     [int]$InitMaxMs          = 300,
     [int]$ResponsiveMaxMs    = 1500

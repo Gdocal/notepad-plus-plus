@@ -47,11 +47,17 @@ These have caused real bugs or wasted time in previous sessions:
    it. Failing this gives wrong tab icons and the "Your backup file
    cannot be found" prompt storm on shutdown.
 
-4. **Never `updateTimeStamp()` after loading content in
-   `applyLazyContent` / `resolveLazyBuffer`.** Keep `_timeStamp =
-   session._originalFileLastModifTimestamp` so `checkFileState`
-   detects externally-modified files and raises the stock reload
-   prompt (R15).
+4. **Never call `checkFileState()` in `applyLazyContent` /
+   `resolveLazyBuffer`.** Stock NPP does not run a file-state check
+   on session load when `_fileAutoDetection == cdEnabledNew` (the
+   default), so doing it ourselves causes a startup reload-prompt
+   storm (R15 — verified empirically against stock 8.9.6.1 and
+   8.9.6.4). The correct behaviour is `updateTimeStamp()` to refresh
+   the buffer's stored mtime after the content is loaded; that
+   matches stock's open-file path and lets stock's later focus /
+   monitor mechanisms detect any subsequent external change. See
+   §6 "Don't-do list" and the inline comments in
+   `applyLazyContent` / `resolveLazyBuffer`.
 
 5. **Worker thread shutdown: detach, do not join.** A worker stuck
    inside `ReadFile` on an unreachable path would otherwise gate
