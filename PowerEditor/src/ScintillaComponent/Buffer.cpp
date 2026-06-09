@@ -1933,21 +1933,8 @@ bool FileManager::applyLazyContent(BufferID id, const char* bytes, size_t nbByte
 
 	if (fromBackup)
 	{
-		// Snapshot-restore: content IS the user's unsaved edits. Keep dirty
-		// and leave _timeStamp at session's original mtime of the *original*
-		// file (not the backup) so that if the original has been changed on
-		// disk since last NPP session, checkFileState catches it and raises
-		// the stock reload prompt. This matches eager snapshot restore
-		// (R15 S2): user is warned; choosing "reload" discards their
-		// backup edits in favour of the new disk content, choosing "no"
-		// marks the buffer unsync and keeps the edits.
+		// Snapshot-restore: content IS the user's unsaved edits. Keep dirty.
 		buf->setDirty(true);
-
-		// Skip checkFileState when the original doesn't exist on disk —
-		// those are untitled-tab backups (filename like "new 12") where
-		// there is no original file to compare against.
-		if (doesFileExist(buf->getFullPathName()))
-			buf->checkFileState();
 	}
 	else
 	{
@@ -1955,21 +1942,22 @@ bool FileManager::applyLazyContent(BufferID id, const char* bytes, size_t nbByte
 		buf->setDirty(false);
 		buf->setLoadedDirty(false);
 		buf->setUnsync(false);
-
 		buf->_isFromNetwork = PathIsNetworkPath(buf->getFullPathName());
-
-		// External-change detection (R15 S1): keep buf->_timeStamp =
-		// session's original mtime. If the file was touched externally
-		// since that snapshot, checkFileState sets DOC_MODIFIED and the
-		// stock "reload externally modified?" prompt fires — same UX as
-		// eager restore. The user's auto-update preference is honoured
-		// automatically because we route through the same code path.
-		buf->checkFileState();
 	}
 
-	// Fire the omnibus notification. Status is already handled above via
-	// checkFileState (which fires its own BufferChangeStatus when the state
-	// flips), so we mask it out here to avoid a duplicate.
+	// Match stock behaviour: update the buffer's stored mtime to the
+	// current on-disk mtime now, so subsequent stock file-change checks
+	// (focus change, monitor thread, explicit reload) compare against
+	// the correct baseline. R15 originally kept the session mtime to
+	// trigger the reload prompt at load time — that was a regression
+	// vs stock NPP, which never fires the prompt during startup when
+	// _fileAutoDetection is cdEnabledNew (the default).
+	buf->updateTimeStamp();
+
+	// Fire the omnibus notification. Mask out Status because no status
+	// change has occurred (the buffer is DOC_REGULAR / DOC_UNNAMED as
+	// it was when created); raising BufferChangeStatus here would push
+	// the buffer through the reload-prompt path in notifyBufferChanged.
 	beNotifiedOfBufferChange(buf, BufferChangeMask & ~BufferChangeStatus);
 	return true;
 }
@@ -2042,19 +2030,16 @@ bool FileManager::resolveLazyBuffer(BufferID id)
 		setLoadedBufferEncodingAndEol(buf, unicodeConvertor, fmt._encoding, fmt._eolFormat);
 
 		// Snapshot-restore: content IS the user's unsaved edits. Keep dirty.
-		// IMPORTANT — do NOT overwrite _timeStamp with the current disk
-		// mtime: it must remain equal to session's original mtime so that
-		// checkFileState can detect if the *original* file was changed
-		// externally since last NPP session (R15 S2). If the original has
-		// since moved on disk, DOC_MODIFIED fires and the user is prompted
-		// — exactly as eager snapshot restore behaves.
+		// Sync timestamp with current original disk mtime (if original still
+		// exists) so stock NPP's later file-change checks compare against
+		// the right baseline. Do NOT call checkFileState here — stock NPP
+		// does not check file state on session load when _fileAutoDetection
+		// is cdEnabledNew (the default), and forcing it caused a regression
+		// (reload-prompt storm at startup).
 		buf->setDirty(true);
 		if (doesFileExist(buf->getFullPathName()))
-			buf->checkFileState();
+			buf->updateTimeStamp();
 
-		// Omnibus notification for the remaining buffer-state changes.
-		// BufferChangeStatus is excluded because checkFileState already
-		// fired its own when it flipped status to DOC_MODIFIED (if it did).
 		beNotifiedOfBufferChange(buf, BufferChangeMask & ~BufferChangeStatus);
 		return true;
 	}
@@ -2079,17 +2064,13 @@ bool FileManager::resolveLazyBuffer(BufferID id)
 	buf->setLoadedDirty(false);
 	buf->setUnsync(false);
 
-	// External-change detection (R15): keep buf->_timeStamp = session's
-	// original on-disk mtime (set in newLazyDocument from the session
-	// entry). checkFileState will compare that against current disk mtime;
-	// a mismatch flips status to DOC_MODIFIED and fires BufferChangeStatus,
-	// which routes through the stock "reload externally modified?" prompt
-	// (or auto-update path) just like eager restore. Without this the
-	// user would silently get current content with no awareness.
-	buf->checkFileState();
+	// Match stock NPP: refresh the buffer's stored mtime to the current
+	// disk mtime. Stock does NOT force a checkFileState at load — it lets
+	// the focus-change / monitor mechanisms detect later changes. Calling
+	// checkFileState here causes the regression of a reload-prompt storm
+	// at startup (verified empirically against stock 8.9.6.1).
+	buf->updateTimeStamp();
 
-	// Fire the omnibus notification minus Status (checkFileState already
-	// fired its own BufferChangeStatus if the state flipped).
 	beNotifiedOfBufferChange(buf, BufferChangeMask & ~BufferChangeStatus);
 	return true;
 }

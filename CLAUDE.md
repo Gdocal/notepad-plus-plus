@@ -100,6 +100,38 @@ by our changes are NOT.
 
 ## 5. Verification — REQUIRED before any release
 
+### 5.0 GOLDEN RULE — always diff against stock
+
+Before claiming any user-visible behaviour is "stock NPP doing X",
+verify it. The procedure is mechanical:
+
+1. `git checkout upstream/master` (detached HEAD is fine).
+2. Build Release x64.
+3. Save the binary as `F:\NppBackups\stock_<version>_notepad++.exe`.
+4. Run it in `F:\NppBackups\stock_test\` (a portable env using a
+   copy of the user's real session.xml + backup/ dir — never the
+   originals).
+5. Observe / count what you want to test (dialogs, icons, exit
+   time).
+6. `git checkout feature/lazy-session-load` (with `git stash pop` if
+   you stashed) and build our binary.
+7. Run in the same portable env. Diff the observations.
+8. Any divergence is a regression; do NOT explain it away as
+   "stock works that way too" without the stock binary in front of
+   you.
+
+**This rule exists because of a real failure.** A previous session
+shipped the R15 fix that called `checkFileState()` after lazy load
+on the false premise that "stock NPP also prompts about externally
+modified files at startup". Empirically it does NOT (when
+`_fileAutoDetection == cdEnabledNew`, which is the default). The
+"fix" caused a startup prompt storm regression that the user only
+caught by manually closing dialogs. The R15-related
+`checkFileState()` calls have since been removed from
+`applyLazyContent` and `resolveLazyBuffer`. Don't re-introduce.
+
+### 5.1 The smoke test
+
 **ALL verification is automated. Never ask the user to manually
 check icons / click prompts / observe startup time.** Run
 `tools/smoke_test.ps1` (see §8). It:
@@ -132,23 +164,67 @@ Acceptance thresholds:
 ## 6. Known bugs to never re-introduce
 
 Each is described in detail in
-[`LAZY_SESSION_RISKS.md`](LAZY_SESSION_RISKS.md). Quick checklist:
+[`LAZY_SESSION_RISKS.md`](LAZY_SESSION_RISKS.md). Every entry below
+**must** have a corresponding automated check in
+`tools/smoke_test.ps1`. When a new bug is discovered (by the user,
+by maintainer feedback, or by a release sanity run), append it
+here AND add a check to the smoke test BEFORE shipping the next
+release.
 
-| ID | Symptom | Guard |
-|---|---|---|
-| R1 | Active tab placed at tab-bar index 0 | `DocTabView::addBufferAt` with explicit `sessionIndex` |
-| R2 | Closing during pump drops 300+ tabs from session.xml | `getCurrentOpenedFiles` drains `_pendingSessionInserts` first |
-| R3/R4 | Crash on null `_doc` | All `getDocument()` callers must guard; closeBuffer guards SCI_RELEASEDOCUMENT |
-| R5 | Find in all open misses lazy tabs | `findInOpenedFiles` resolves before SCI_SETDOCPOINTER |
-| R6 | Plugins at NPPN_READY see incomplete file list | `NPPM_GETNB(OPEN)FILES` includes pending entries |
-| R7 | Dirty icon delayed | `addBuffer(At)` computes correct icon at insert |
-| R9 | Windows-dialog Size column shows 0 for lazy | falls back to on-disk / backup file size |
-| R11 | WM_SETREDRAW stuck on exception | `BatchInsertGuard` RAII |
-| R13 | Wait cursor for full pump duration | session-insert pump uses `SetTimer`, lowest priority |
-| R14 | Click on cold tab freezes UI | worker thread reads bytes off-main |
-| R15 | External change not surfaced | preserve session `_timeStamp`, let `checkFileState` flip status |
-| donho-1 | All inactive tabs red even when clean | gate `setDirty(true)` on `doesFileExist(backupPath)` |
-| donho-2 | "Your backup file cannot be found" storm on quit | same gate as donho-1 |
+### Active checklist
+
+| ID | Symptom | Guard | Automated check |
+|---|---|---|---|
+| R1 | Active tab placed at tab-bar index 0 | `DocTabView::addBufferAt` with explicit `sessionIndex` | smoke test compares `session.xml` order pre/post launch |
+| R2 | Closing during pump drops 300+ tabs from session.xml | `getCurrentOpenedFiles` drains `_pendingSessionInserts` first | smoke test session-count integrity check |
+| R3/R4 | Crash on null `_doc` | All `getDocument()` callers must guard; `closeBuffer` guards `SCI_RELEASEDOCUMENT` | smoke test launches + closes; non-zero exit on crash |
+| R5 | Find in all open misses lazy tabs | `findInOpenedFiles` resolves before `SCI_SETDOCPOINTER` | TODO: scripted Ctrl+Shift+F search for known string |
+| R6 | Plugins at NPPN_READY see incomplete file list | `NPPM_GETNB(OPEN)FILES` includes pending entries | TODO: SendMessage probe of these IDs at startup |
+| R7 | Dirty icon delayed | `addBuffer(At)` computes correct icon at insert | smoke test pixel-diff vs stock at +5 s |
+| R9 | Windows-dialog Size column shows 0 for lazy | falls back to on-disk / backup file size | TODO: scripted open of Windows dialog + parse |
+| R11 | `WM_SETREDRAW` stuck on exception | `BatchInsertGuard` RAII | static (compile-time RAII) — no runtime test |
+| R13 | Wait cursor for full pump duration | session-insert pump uses `SetTimer`, lowest priority | smoke test `SendMessageTimeout(50 ms)` samples |
+| R14 | Click on cold tab freezes UI | worker thread reads bytes off-main | smoke test launches + sends Ctrl+PgDn at +3 s, expects no >50 ms stall |
+| R15 | Startup prompt storm "This file has been modified by another program" | **revert reflex**: do NOT call `checkFileState()` in `applyLazyContent` / `resolveLazyBuffer`. Stock NPP does not check at load when `cdEnabledNew`. | smoke test counts startup `#32770` dialogs; must equal stock baseline |
+| donho-1 | All inactive tabs red even when clean | gate `setDirty(true)` on `doesFileExist(backupPath)` in pump | smoke test pixel-diff vs stock at +5 s (same as R7) |
+| donho-2 | "Your backup file cannot be found" storm on quit | same gate as donho-1 | smoke test counts close-time `#32770` dialogs |
+
+### How to add a new entry
+
+When the user (or a maintainer review, or a smoke-test failure)
+surfaces a new misbehaviour:
+
+1. Reproduce it deterministically (the GOLDEN RULE — diff against
+   stock).
+2. Add a row to the table above.
+3. Add a row to `LAZY_SESSION_RISKS.md` with the full analysis.
+4. Add a check to `tools/smoke_test.ps1` that fails when the bug
+   is present and passes when it is fixed. Run the new check
+   against the stock baseline AND our current build to make sure
+   the threshold is set correctly.
+5. Fix the bug.
+6. Re-run the smoke test — all rows in this table must now pass.
+7. Commit fix + check + doc updates in a single commit.
+
+### Don't-do list (each was tried and broke something)
+
+- **`std::thread::native_handle()` + `WaitForSingleObject`** —
+  HANDLE on MSVC, `pthread_t` on MinGW-w64. Breaks the MinGW32 /
+  MinGW64 / CLANG64 CI jobs. Detach the worker thread instead.
+- **`doesFileExist` / `GetFileAttributesExW` in the
+  session-insert pump on the SESSION FILENAME** — blocks the main
+  thread for the SMB timeout on stopped WSL distros / disconnected
+  UNC shares.
+- **`setDirty(true)` based on `_backupFilePath != ""`** — must
+  also check that the backup file exists, otherwise icons and the
+  close-time prompt regress (donho-1 / donho-2).
+- **`PostMessage`-to-self pump loop for content load** — makes
+  Windows mark the app "not responding" and pops the wait cursor
+  even though message dispatch is happening. Use `SetTimer` with
+  `USER_TIMER_MINIMUM` or move IO off the main thread entirely.
+- **`checkFileState()` after `applyLazyContent` /
+  `resolveLazyBuffer`** — causes the R15 reload-prompt storm.
+  Stock NPP does NOT check file state at load.
 
 ---
 
