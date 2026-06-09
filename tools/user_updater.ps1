@@ -39,6 +39,26 @@ try {
         return
     }
 
+    # Writing to Program Files needs admin. If we're not elevated, re-launch
+    # ourselves elevated so the user sees one UAC prompt and the swap actually
+    # succeeds. Without this the script "ran" but silently failed to install.
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Log "Not elevated; relaunching self with -Verb RunAs"
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+        foreach ($k in $PSBoundParameters.Keys) {
+            $argList += "-$k"
+            $argList += $PSBoundParameters[$k]
+        }
+        try {
+            Start-Process powershell -ArgumentList $argList -Verb RunAs -Wait
+            Log "Elevated child finished"
+        } catch {
+            Log "Elevation refused or failed: $_"
+        }
+        return
+    }
+
     # Fetch the latest release from GitHub.
     $api = "https://api.github.com/repos/$ForkOwner/$ForkRepo/releases/latest"
     $headers = @{ 'User-Agent' = 'npp-lazy-updater' }
