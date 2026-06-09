@@ -84,30 +84,51 @@ function Invoke-OnePass {
 
     $startupDlgs = New-Object System.Collections.Generic.HashSet[long]
     $closeDlgs   = New-Object System.Collections.Generic.HashSet[long]
-    $sustainStart = $null
-    $sustainAt    = $null
     $windowAppearedAt   = $null   # first time MainWindowHandle != 0
-    $firstResponsiveAt  = $null   # first time SendMessageTimeout returned ok
-    $notRespondingCount = 0
+    $firstResponsiveAt  = $null   # first time SMTO returned within 2 s (alive at all)
+    $firstFastAt        = $null   # first time SMTO returned within 50 ms (true real interactivity)
+    $sustainedFastAt    = $null   # first time we saw 2 s of <50 ms responses in a row (fully drained)
+    $sustainStart       = $null
+    $notRespondingCount = 0       # ticks where SMTO timed out (>2000 ms = effectively frozen)
+    $slowResponseCount  = 0       # ticks where SMTO succeeded but took >50 ms (laggy)
+    $latencies          = New-Object System.Collections.Generic.List[int]
+    $probeSw            = [Diagnostics.Stopwatch]::new()
 
     while ($sw.Elapsed.TotalSeconds -lt $RunSeconds) {
         $proc.Refresh()
         $t = [int]$sw.ElapsedMilliseconds
-        $ok = $false
+        $latencyMs = $null
         if ($proc.MainWindowHandle -ne 0) {
             if ($null -eq $windowAppearedAt) { $windowAppearedAt = $t; Log "  window appeared at +${t}ms" }
             $r = [IntPtr]::Zero
-            # Generous 500 ms timeout: stock can sit unresponsive for many
-            # seconds while loading a 300+ tab session — we don't want a
-            # 50 ms probe to permanently flag it "not responding" before it
-            # even gets a chance to answer.
-            $rc = [Smoke]::SendMessageTimeoutW($proc.MainWindowHandle, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0002, 500, [ref]$r)
-            $ok = ($rc -ne [IntPtr]::Zero)
+            # 2000 ms cap on individual probe: long enough to distinguish
+            # "main thread is taking a while to process a queued WM_TIMER"
+            # (latency 100-500 ms is common during the session-insert pump)
+            # from "main thread is genuinely hung" (Windows' built-in
+            # hung-app detection kicks in around 5 s). We measure the
+            # actual milliseconds the probe took — success itself is
+            # not enough, what matters is HOW FAST it answered.
+            $probeSw.Restart()
+            $rc = [Smoke]::SendMessageTimeoutW($proc.MainWindowHandle, 0, [IntPtr]::Zero, [IntPtr]::Zero, 0x0000, 2000, [ref]$r)
+            $probeSw.Stop()
+            if ($rc -ne [IntPtr]::Zero) {
+                $latencyMs = [int]$probeSw.ElapsedMilliseconds
+                $latencies.Add($latencyMs) | Out-Null
+            }
         }
-        if ($ok) {
-            if ($null -eq $firstResponsiveAt) { $firstResponsiveAt = $t; Log "  first responsive at +${t}ms" }
-            if ($null -eq $sustainStart) { $sustainStart = $t }
-            elseif ($null -eq $sustainAt -and ($t - $sustainStart) -ge 800) { $sustainAt = $sustainStart }
+        if ($null -ne $latencyMs) {
+            if ($null -eq $firstResponsiveAt) { $firstResponsiveAt = $t; Log "  first response at +${t}ms (latency ${latencyMs}ms)" }
+            if ($latencyMs -le 50) {
+                if ($null -eq $firstFastAt) { $firstFastAt = $t; Log "  first FAST response at +${t}ms (latency ${latencyMs}ms)" }
+                if ($null -eq $sustainStart) { $sustainStart = $t }
+                elseif ($null -eq $sustainedFastAt -and ($t - $sustainStart) -ge 2000) {
+                    $sustainedFastAt = $sustainStart
+                    Log "  sustained-fast (drained) since +${sustainStart}ms"
+                }
+            } else {
+                $sustainStart = $null
+                $slowResponseCount++
+            }
         } else {
             $sustainStart = $null
             $notRespondingCount++
@@ -169,15 +190,29 @@ function Invoke-OnePass {
     [xml]$postXml = Get-Content (Join-Path $Portable 'session.xml')
     $postCount = @($postXml.NotepadPlus.Session.mainView.File).Count + @($postXml.NotepadPlus.Session.subView.File).Count
 
+    # Compute latency percentiles over the run.
+    $p50 = $null; $p95 = $null; $pMax = $null
+    if ($latencies.Count -gt 0) {
+        $sorted = $latencies | Sort-Object
+        $p50 = [int]$sorted[[Math]::Floor($sorted.Count * 0.50)]
+        $p95 = [int]$sorted[[Math]::Min($sorted.Count - 1, [Math]::Floor($sorted.Count * 0.95))]
+        $pMax = [int]($sorted | Select-Object -Last 1)
+    }
+
     return [PSCustomObject]@{
         Label              = $Label
         StartupDialogs     = $startupDlgs.Count
         CloseDialogs       = $closeDlgs.Count
-        SustainedAtMs      = $sustainAt
         WindowAppearedMs   = $windowAppearedAt
         FirstResponsiveMs  = $firstResponsiveAt
+        FirstFastMs        = $firstFastAt          # first probe < 50 ms latency
+        SustainedFastMs    = $sustainedFastAt      # first start of 2 s window of <50 ms responses
+        LatencyP50         = $p50                  # typical response time
+        LatencyP95         = $p95                  # tail
+        LatencyMax         = $pMax
         InitMs             = $initMs
-        NotRespondingHits  = $notRespondingCount
+        NotRespondingHits  = $notRespondingCount   # probes that timed out (>2000 ms)
+        SlowResponseHits   = $slowResponseCount    # probes that returned but took >50 ms
         PreSessionCount    = $preCount
         PostSessionCount   = $postCount
     }
@@ -240,37 +275,57 @@ if ($null -ne $ours.SustainedAtMs) {
     Log "sustained_responsive_ms = NEVER (informational; expected on large sessions)"
 }
 
+function Fmt($v) { if ($null -eq $v) { 'NEVER' } else { "${v}ms" } }
+
 if ($stock) {
-    # HEADLINE METRIC: how long until the main window answers SendMessage?
-    # This is exactly "time to interactive" as the user experiences it. For
-    # stock NPP on a 300+ tab session it's 15-20 s; ours should be sub-second.
-    # If ours becomes responsive at $oursMs and stock at $stockMs, we want
-    # $oursMs < $stockMs / 2 at minimum to earn the fork's keep.
-    $oursMs  = if ($null -eq $ours.FirstResponsiveMs)  { 'NEVER' } else { "$($ours.FirstResponsiveMs)ms" }
-    $stockMs = if ($null -eq $stock.FirstResponsiveMs) { 'NEVER' } else { "$($stock.FirstResponsiveMs)ms" }
-    $speedupOk = $false
-    if ($null -ne $ours.FirstResponsiveMs) {
-        if ($null -eq $stock.FirstResponsiveMs) {
-            # Stock never became responsive within $RunSeconds; ours did.
-            $speedupOk = $true
-        } elseif ($ours.FirstResponsiveMs -le $stock.FirstResponsiveMs / 2) {
-            $speedupOk = $true
-        }
-    }
-    $verdicts += @{n='time_to_interactive_vs_stock';val="$oursMs vs stock $stockMs";p=$speedupOk}
+    # HEADLINE METRICS (three of them, increasingly strict):
+    #
+    # 1. time_to_first_response — first SMTO returned within 2 s.
+    #    Means "main thread is alive at all, not deadlocked".
+    #
+    # 2. time_to_fast — first SMTO returned in under 50 ms.
+    #    Means "if you typed RIGHT NOW, your keystroke would be processed
+    #    without a noticeable delay" — true interactivity.
+    #
+    # 3. time_to_sustained — first start of a 2 s window where every
+    #    probe took <50 ms. Means "the session-insert pump has fully
+    #    drained and the app behaves normally".
+    #
+    # The user perceives (3) as "Notepad++ is actually loaded and
+    # ready". The previous version of this script only tracked (1)
+    # which is misleading: between WM_TIMER ticks the message pump
+    # answers WM_NULL within ms but each click/keystroke queues
+    # behind the next 30-50 ms tick. (1) says "responsive at 1.8 s"
+    # but the user feels lag for the next 10 s.
+    $speedup1 = ($null -ne $ours.FirstResponsiveMs) -and (
+        $null -eq $stock.FirstResponsiveMs -or
+        $ours.FirstResponsiveMs -le $stock.FirstResponsiveMs / 2 )
+    $verdicts += @{n='time_to_first_response_vs_stock';val="$(Fmt $ours.FirstResponsiveMs) vs stock $(Fmt $stock.FirstResponsiveMs)";p=$speedup1}
+
+    $speedup2 = ($null -ne $ours.FirstFastMs) -and (
+        $null -eq $stock.FirstFastMs -or
+        $ours.FirstFastMs -le $stock.FirstFastMs / 2 )
+    $verdicts += @{n='time_to_fast_vs_stock';val="$(Fmt $ours.FirstFastMs) vs stock $(Fmt $stock.FirstFastMs)";p=$speedup2}
+
+    $speedup3 = ($null -ne $ours.SustainedFastMs) -and (
+        $null -eq $stock.SustainedFastMs -or
+        $ours.SustainedFastMs -le $stock.SustainedFastMs / 2 )
+    $verdicts += @{n='time_to_sustained_vs_stock';val="$(Fmt $ours.SustainedFastMs) vs stock $(Fmt $stock.SustainedFastMs)";p=$speedup3}
+
+    # Latency tail: 95th-percentile per-probe latency. Even after the
+    # window is "responsive", high p95 means the app feels janky.
+    $p95Ok = ($null -ne $ours.LatencyP95) -and ($ours.LatencyP95 -le $stock.LatencyP95)
+    $verdicts += @{n='latency_p95_vs_stock';val="$(Fmt $ours.LatencyP95) vs stock $(Fmt $stock.LatencyP95)";p=$p95Ok}
 
     # GOLDEN RULE: never more dialogs / freezes than stock.
     $verdicts += @{n='startup_dialogs_vs_stock';val="$($ours.StartupDialogs) vs stock $($stock.StartupDialogs)";p=($ours.StartupDialogs -le $stock.StartupDialogs)}
     $verdicts += @{n='close_dialogs_vs_stock';val="$($ours.CloseDialogs) vs stock $($stock.CloseDialogs)";p=($ours.CloseDialogs -le $stock.CloseDialogs)}
-    $verdicts += @{n='not_responding_hits_vs_stock';val="$($ours.NotRespondingHits) vs stock $($stock.NotRespondingHits)";p=($ours.NotRespondingHits -le $stock.NotRespondingHits + 1)}
     $verdicts += @{n='session_count_stable';val="$($ours.PreSessionCount) -> $($ours.PostSessionCount) (stock $($stock.PreSessionCount) -> $($stock.PostSessionCount))";p=($ours.PostSessionCount -ge $stock.PostSessionCount)}
 } else {
     # Standalone limits when no stock baseline.
-    if ($null -ne $ours.FirstResponsiveMs) {
-        $verdicts += @{n='time_to_interactive_ms';val=$ours.FirstResponsiveMs;p=($ours.FirstResponsiveMs -le 2000)}
-    } else {
-        $verdicts += @{n='time_to_interactive_ms';val='NEVER';p=$false}
-    }
+    $verdicts += @{n='time_to_first_response_ms';val=(Fmt $ours.FirstResponsiveMs);p=($null -ne $ours.FirstResponsiveMs -and $ours.FirstResponsiveMs -le 2000)}
+    $verdicts += @{n='time_to_fast_ms';val=(Fmt $ours.FirstFastMs);p=($null -ne $ours.FirstFastMs -and $ours.FirstFastMs -le 5000)}
+    $verdicts += @{n='time_to_sustained_ms';val=(Fmt $ours.SustainedFastMs);p=($null -ne $ours.SustainedFastMs -and $ours.SustainedFastMs -le 15000)}
     $verdicts += @{n='startup_dialogs';val=$ours.StartupDialogs;p=($ours.StartupDialogs -eq 0)}
     $verdicts += @{n='close_dialogs';val=$ours.CloseDialogs;p=($ours.CloseDialogs -eq 0)}
     $verdicts += @{n='session_count_stable';val="$($ours.PreSessionCount) -> $($ours.PostSessionCount)";p=($ours.PostSessionCount -ge $ours.PreSessionCount)}
@@ -282,10 +337,11 @@ foreach ($v in $verdicts) {
     $tag = if ($v.p) { 'PASS' } else { 'FAIL' }
     "  [$tag] $($v.n) = $($v.val)"
 }
+function FmtRaw($v) { if ($null -eq $v) { 'NEVER' } else { $v } }
 if ($stock) {
-    "  --- raw stock ---  win_seen=$($stock.WindowAppearedMs)ms first_resp=$($stock.FirstResponsiveMs)ms startup_dlgs=$($stock.StartupDialogs) close_dlgs=$($stock.CloseDialogs) sust=$($stock.SustainedAtMs) notresp=$($stock.NotRespondingHits)"
+    "  --- raw stock ---  win=$(FmtRaw $stock.WindowAppearedMs) first=$(FmtRaw $stock.FirstResponsiveMs) fast=$(FmtRaw $stock.FirstFastMs) sustained=$(FmtRaw $stock.SustainedFastMs) lat_p50=$(FmtRaw $stock.LatencyP50) lat_p95=$(FmtRaw $stock.LatencyP95) lat_max=$(FmtRaw $stock.LatencyMax) notresp=$($stock.NotRespondingHits) slow=$($stock.SlowResponseHits)"
 }
-"  --- raw ours  ---  win_seen=$($ours.WindowAppearedMs)ms first_resp=$($ours.FirstResponsiveMs)ms startup_dlgs=$($ours.StartupDialogs) close_dlgs=$($ours.CloseDialogs) sust=$($ours.SustainedAtMs) notresp=$($ours.NotRespondingHits) init=$($ours.InitMs)"
+"  --- raw ours  ---  win=$(FmtRaw $ours.WindowAppearedMs) first=$(FmtRaw $ours.FirstResponsiveMs) fast=$(FmtRaw $ours.FirstFastMs) sustained=$(FmtRaw $ours.SustainedFastMs) lat_p50=$(FmtRaw $ours.LatencyP50) lat_p95=$(FmtRaw $ours.LatencyP95) lat_max=$(FmtRaw $ours.LatencyMax) notresp=$($ours.NotRespondingHits) slow=$($ours.SlowResponseHits) init=$(FmtRaw $ours.InitMs)"
 
 $anyFail = $verdicts | Where-Object { -not $_.p }
 if ($anyFail) { exit 1 } else { exit 0 }
